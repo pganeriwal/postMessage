@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1.0">
+    <title>Single Sign-on</title>
+    <style>
+        .pg-message-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100%;
+            font-size: 24px;
+        }
+    </style>
+    <script type="module">
+        import { PostReceive } from './postReceive.js';
+        const MODE = 'mode';
+        const currentUrl = new URL(location.href);
+        const currentMode = currentUrl.searchParams.get(MODE);
+        const targetWindow = window.opener;
+        const isTargetWindowValid = "function" === typeof targetWindow?.postMessage;
+        if (!isTargetWindowValid) {
+            throw ("targetWindow is invalid");
+        }
+        const targetOrigin = "*";
+        const sender = `redirect.html__${currentMode}`;
+        const receivedMessageCallback = (data, event) => {
+            //TODO handle the received data and event accordingly
+        };
+        const postReceive = new PostReceive({
+            sender, targetWindow, targetOrigin, receivedMessageCallback
+        });
+        const sendHandshakeMessage = async () => {
+            console.debug("Handshake start");
+            await postReceive.sendHandshakeMessage();
+            console.debug("Handshake end");
+        };
+        sendHandshakeMessage();
+        const CHECK_AUTH = 'check-auth';
+        const AUTH_SUCCESS = 'auth-success';
+        const LOGOUT = 'logout';
+        const LOGOUT_SUCCESS = 'logout-success';
+        const CLOSE_WINDOW_MESSAGE = "This window can be closed now.";
+        const setRelayURL = (authURL) => {
+            let retURL = authURL;
+            if (authURL && "string" === typeof authURL) {
+                /**
+                 * Once login is successful or session exists, then the server should
+                 * relay back to the redirect.html with mode=auth-success
+                 */
+                const relayURL = new URL(location.href);
+                relayURL.searchParams.set(MODE, AUTH_SUCCESS);
+                const url = new URL(authURL);
+                url.searchParams.set('relayState', relayURL.toString());
+                url.searchParams.set('overrideRelayState', true);
+                retURL = url.toString();
+            }
+            return retURL;
+        };
+        const setLogoutRelayURL = (logoutURL) => {
+            let retURL = logoutURL;
+            if (logoutURL && "string" === typeof logoutURL) {
+                /**
+                 * Once logout is successful, then the server should
+                 * relay back to the redirect.html with mode=logout-success
+                 */
+                const relayURL = new URL(location.href);
+                relayURL.searchParams.set(MODE, LOGOUT_SUCCESS);
+                const url = new URL(logoutURL);
+                url.searchParams.set('logoutRelayState', relayURL.toString());
+                retURL = url.toString();
+            }
+            return retURL;
+        };
+        const getAuthDetails = () => {
+            return postReceive.sendMessage({
+                data: {
+                    type: "auth-details",
+                    message: "share the auth URL details",
+                }
+            });
+        };
+        const getLogoutDetails = () => {
+            return postReceive.sendMessage({
+                data: {
+                    type: "logout-details",
+                    message: "share the logout URL details",
+                }
+            });
+        };
+        const callAPI = async (url) => {
+            /**
+             * credentials: 'include'
+             *      is required to set/receive the cookies from a cross-origin request/response
+             * redirect: 'manual'
+             *      is required to load the redirect URL on the window rather than calling it as an API
+             */
+            return fetch(
+                url,
+                {
+                    credentials: 'include',
+                    redirect: 'manual',
+                }
+            ).then(response => {
+                if (response.ok && 200 === response.status) {
+                    return response.json();
+                } else if (!response.redirected
+                    && "opaqueredirect" === response.type
+                    && response.url
+                ) {
+                    console.debug("Loading: ", response.url);
+                    location.href = response.url;
+                    /**
+                     * The window is loaded with the SSO URL, hence returning the unresolved Promise
+                     */
+                    return new Promise(resolve => { });
+                }
+                else {
+                    throw new Error(response.status);
+                }
+            });
+        };
+        const sendUserDetails = (userDetails) => {
+            /**
+             * Send the user details to the EB application
+             */
+            return postReceive.sendMessage({
+                data: {
+                    type: "user-details",
+                    message: "user details",
+                    userDetails,
+                }
+            });
+        };
+        const sendLogoutSuccess = () => {
+            /**
+             * Send the logout success to the EB application
+             */
+            return postReceive.sendMessage({
+                data: {
+                    type: "logout-success",
+                    message: "logout success",
+                }
+            });
+        };
+        const sendError = (message) => {
+            /**
+             * Send the error to the EB application
+             */
+            return postReceive.sendMessage({
+                data: {
+                    type: "error",
+                    message,
+                }
+            });
+        };
+        const displayMessage = (message) => {
+            console.debug(message);
+            const el = document.getElementById("pg-message");
+            if (el) {
+                el.innerHTML = message;
+            }
+        };
+        const displayMessageAndCloseWindow = (message) => {
+            displayMessage(message);
+            window.close();
+        };
+        const handleCheckAuthMode = async () => {
+            /**
+             * Get the Auth URL details
+             * Need to check the authentication with the IDP
+             */
+            console.debug("Auth details start");
+            const authDetails = await getAuthDetails();
+            console.debug("Auth details end");
+            if (authDetails) {
+                /**
+                 * Once login is successful or session exists, then the server should
+                 * relay back to the redirect.html with mode=auth-success
+                 */
+                console.debug("Received authURL", authDetails.authURL);
+                const url = setRelayURL(authDetails.authURL);
+                console.debug("Auth URL: ", url);
+                if (url) {
+                    try {
+                        console.debug("Authenticate user start");
+                        const userDetails = await callAPI(url);
+                        console.debug("Authenticate user end");
+                        /**
+                         * invalid userDetails (null, undefined etc.) should be handled in the application
+                         */
+                        console.debug("Send user details start");
+                        await sendUserDetails(userDetails);
+                        console.debug("Send user details end");
+                    } catch (error) {
+                        const message = (error && "string" === typeof error.message) ? error.message : error;
+                        console.debug("Send error start");
+                        await sendError(message);
+                        console.debug("Send error end");
+                    }
+                    /**
+                     * Once the user details OR error is sent to the EB application, close this window
+                     */
+                    displayMessageAndCloseWindow(CLOSE_WINDOW_MESSAGE);
+                }
+            }
+        };
+        const handleLogoutMode = async () => {
+            /**
+             * Get the Logout URL details
+             * Need to logout with the IDP
+             */
+            console.debug("Logout details start");
+            const logoutDetails = await getLogoutDetails();
+            console.debug("Logout details end");
+            if (logoutDetails) {
+                /**
+                 * Once logout is successful, then the server should
+                 * relay back to the redirect.html with mode=logout-success
+                 */
+                console.debug("Received logoutURL", logoutDetails.logoutURL);
+                const url = setLogoutRelayURL(logoutDetails.logoutURL);
+                console.debug("Logout URL: ", url);
+                if (url) {
+                    try {
+                        /**
+                         * If the session is valid then the logout API will always return a 302
+                         * and hence the await will never be resolved
+                         * since the page will be reloaded with SSO logout URL
+                         * and once the SSO session is cleared
+                         * then the redirect.html will be loaded with mode=logout-success
+                         */
+                        console.debug("Logout user start");
+                        await callAPI(url);
+                        console.debug("Logout user end");
+                    } catch (error) {
+                        const message = (error && "string" === typeof error.message) ? error.message : error;
+                        console.debug("Send error start");
+                        await sendError(message);
+                        console.debug("Send error end");
+                    }
+                    /**
+                     * Once the user details OR error is sent to the EB application, close this window
+                     */
+                    displayMessageAndCloseWindow(CLOSE_WINDOW_MESSAGE);
+                }
+            }
+        };
+        const handleLogoutSuccessMode = async () => {
+            console.debug("Send logout success start");
+            await sendLogoutSuccess();
+            console.debug("Send logout success end");
+            displayMessageAndCloseWindow(CLOSE_WINDOW_MESSAGE);
+        };
+        const handleCurrentMode = async (mode) => {
+            switch (mode) {
+                case CHECK_AUTH:
+                case AUTH_SUCCESS: {
+                    console.debug("Check Auth mode start");
+                    handleCheckAuthMode();
+                    console.debug("Check Auth mode end");
+                    break;
+                }
+                case LOGOUT: {
+                    console.debug("Logout mode start");
+                    handleLogoutMode();
+                    console.debug("Logout mode end");
+                    break;
+                }
+                case LOGOUT_SUCCESS: {
+                    console.debug("Logout success mode start");
+                    handleLogoutSuccessMode();
+                    console.debug("Logout success mode end");
+                    break;
+                }
+                default: {
+                    displayMessage("Invalid mode !!!");
+                    break;
+                }
+            }
+        };
+        handleCurrentMode(currentMode);
+    </script>
+</head>
+
+<body>
+    <div id="pg-message-container" class="pg-message-container">
+        <div id="pg-message" class="pg-message">
+            Do not close this window.
+        </div>
+    </div>
+</body>
+
+</html>
